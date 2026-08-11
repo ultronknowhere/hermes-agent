@@ -149,6 +149,18 @@ class TestShouldExclude:
 
         assert _should_exclude(Path(".skills_prompt_snapshot.json"))
 
+    def test_excludes_only_transient_cron_output_receipts(self):
+        """Prunable delivery receipts must not race full backup enumeration."""
+        from hermes_cli.backup import _should_exclude
+
+        assert _should_exclude(Path("cron/output/job-1/2026-08-11T060000.md"))
+        assert _should_exclude(Path("profiles/coder/cron/output/job-1/run.md"))
+        assert not _should_exclude(Path("cron/jobs.json"))
+        assert not _should_exclude(Path("cron/executions.db"))
+        assert not _should_exclude(Path("profiles/coder/cron/jobs.json"))
+        assert not _should_exclude(Path("profiles/coder/cron/executions.db"))
+        assert not _should_exclude(Path("ops/archive/cron/output/evidence.md"))
+
 
 # ---------------------------------------------------------------------------
 # Backup tests
