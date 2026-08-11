@@ -91,6 +91,7 @@ _EXCLUDED_SUFFIXES = (
 # File names to skip (runtime state that's meaningless on another machine)
 _EXCLUDED_NAMES = {
     ".backup.lock",
+    ".skills_prompt_snapshot.json",
     "gateway.pid",
     "cron.pid",
 }
@@ -344,6 +345,30 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
 # ---------------------------------------------------------------------------
 # SQLite safe copy
 # ---------------------------------------------------------------------------
+
+def _is_sqlite_database(path: Path) -> bool:
+    """Return whether *path* has SQLite's canonical file header."""
+    try:
+        with path.open("rb") as handle:
+            return handle.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
+
+
+def _needs_sqlite_safe_copy(path: Path, rel_path: Path) -> bool:
+    """Route live Hermes DBs and positively identified SQLite through backup().
+
+    Historical ``ops/`` artifacts and external provider trees may contain
+    opaque formats with a ``.db`` suffix. Everywhere else, a malformed DB must
+    remain fail-closed so corrupt live Hermes state cannot look recoverable.
+    """
+    if path.suffix != ".db":
+        return False
+    if _is_sqlite_database(path):
+        return True
+    root_component = rel_path.parts[0] if rel_path.parts else ""
+    return root_component not in {"ops", _EXTERNAL_PREFIX.rstrip("/")}
+
 
 def _safe_copy_db(src: Path, dst: Path) -> bool:
     """Copy a SQLite database safely using the backup() API.
@@ -705,7 +730,7 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
             try:
                 # Safe copy for SQLite databases (handles WAL mode)
-                if abs_path.suffix == ".db":
+                if _needs_sqlite_safe_copy(abs_path, rel_path):
                     # Stage the snapshot alongside the output zip so that the
                     # temp file lives on the same filesystem.  The system
                     # default (/tmp) may be a small tmpfs that cannot hold
@@ -739,15 +764,33 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
                 )
 
         # External memory-provider state, stored under the ``_external/`` arc
-        # prefix. These never include ``.db`` files in practice (config/env
-        # blobs), so a straight zf.write is fine.
+        # prefix. Provider state may include live SQLite databases, so apply
+        # the same WAL-safe classifier used for files under HERMES_HOME.
         for abs_path, arcname in external_to_add:
+            rel_path = Path(arcname)
+            tmp_db: Optional[Path] = None
             try:
-                zf.write(abs_path, arcname=arcname)
-                total_bytes += abs_path.stat().st_size
+                if _needs_sqlite_safe_copy(abs_path, rel_path):
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".db", delete=False, dir=str(out_path.parent)
+                    ) as tmp:
+                        tmp_db = Path(tmp.name)
+                    if _safe_copy_db(abs_path, tmp_db):
+                        snapshot_size = tmp_db.stat().st_size
+                        zf.write(tmp_db, arcname=arcname)
+                        total_bytes += snapshot_size
+                    else:
+                        errors.append(f"  {arcname}: SQLite safe copy failed")
+                        continue
+                else:
+                    zf.write(abs_path, arcname=arcname)
+                    total_bytes += abs_path.stat().st_size
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"  {arcname}: {exc}")
                 continue
+            finally:
+                if tmp_db is not None:
+                    tmp_db.unlink(missing_ok=True)
 
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
@@ -1694,7 +1737,7 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
         ) as zf:
             for index, (abs_path, rel_path) in enumerate(files_to_add, 1):
                 try:
-                    if abs_path.suffix == ".db":
+                    if _needs_sqlite_safe_copy(abs_path, rel_path):
                         # Stage the snapshot alongside the output zip so that the
                         # temp file lives on the same filesystem.  The system
                         # default (/tmp) may be a small tmpfs that cannot hold

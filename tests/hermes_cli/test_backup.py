@@ -143,12 +143,57 @@ class TestShouldExclude:
 
         assert _should_skip_backup_file(fifo, Path("pipe.txt"), tmp_path / "backup.zip")
 
+    def test_excludes_transient_skills_prompt_snapshot(self):
+        """The rebuildable skills cache is atomically replaced during normal use."""
+        from hermes_cli.backup import _should_exclude
+
+        assert _should_exclude(Path(".skills_prompt_snapshot.json"))
+
 
 # ---------------------------------------------------------------------------
 # Backup tests
 # ---------------------------------------------------------------------------
 
 class TestBackup:
+
+    def test_non_sqlite_db_suffix_is_archived_as_regular_file(self, tmp_path, monkeypatch):
+        """Opaque .db artifacts under ops must not trigger SQLite handling."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        opaque = hermes_home / "ops" / "historical" / "opaque.db"
+        opaque.parent.mkdir(parents=True)
+        opaque.write_bytes(b"not sqlite; opaque provider data\n")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        out_zip = tmp_path / "backup.zip"
+        from hermes_cli.backup import run_backup
+
+        run_backup(Namespace(output=str(out_zip)))
+
+        with zipfile.ZipFile(out_zip, "r") as zf:
+            assert zf.read("ops/historical/opaque.db") == opaque.read_bytes()
+
+    def test_zeroed_live_state_db_remains_fail_closed(self, tmp_path, monkeypatch, capsys):
+        """Corrupt live Hermes DBs must never be accepted as opaque artifacts."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        (hermes_home / "state.db").write_bytes(bytes(4096))
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        out_zip = tmp_path / "backup.zip"
+        from hermes_cli.backup import run_backup
+
+        run_backup(Namespace(output=str(out_zip)))
+
+        assert "Backup incomplete" in capsys.readouterr().out
+        with zipfile.ZipFile(out_zip, "r") as zf:
+            assert "state.db" not in zf.namelist()
 
 
     def test_db_snapshots_staged_beside_output_zip(self, tmp_path, monkeypatch):
@@ -1209,6 +1254,99 @@ class TestMemoryProviderExternalPaths:
         os.mkfifo(fifo)
 
         assert _iter_external_files(provider_state) == [regular]
+
+    def test_external_sqlite_wal_is_snapshotted_consistently(self, tmp_path, monkeypatch):
+        """Committed provider rows in WAL must survive the full backup."""
+        hermes_home = tmp_path / ".hermes"
+        self._make_min_tree(hermes_home)
+        (hermes_home / "state.db").unlink()
+        state_conn = sqlite3.connect(hermes_home / "state.db")
+        state_conn.execute("CREATE TABLE sessions(id TEXT)")
+        state_conn.commit()
+        state_conn.close()
+
+        provider_state = tmp_path / ".hindsight"
+        provider_state.mkdir()
+        db = provider_state / "live.db"
+        conn = sqlite3.connect(db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE facts(value INTEGER)")
+        conn.commit()
+        conn.execute("INSERT INTO facts VALUES (42)")
+        conn.commit()
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        import hermes_cli.backup as backup_mod
+        monkeypatch.setattr(
+            backup_mod,
+            "_collect_memory_provider_external_paths",
+            lambda: [provider_state],
+        )
+
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        restored = tmp_path / "restored.db"
+        with zipfile.ZipFile(out_zip) as zf:
+            restored.write_bytes(zf.read("_external/.hindsight/live.db"))
+        rows = sqlite3.connect(restored).execute("SELECT value FROM facts").fetchall()
+        conn.close()
+
+        assert rows == [(42,)]
+
+    def test_external_sqlite_staging_is_removed_when_zip_write_fails(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A failed archive write must not leave plaintext staged provider DBs."""
+        hermes_home = tmp_path / ".hermes"
+        self._make_min_tree(hermes_home)
+        (hermes_home / "state.db").unlink()
+        state_conn = sqlite3.connect(hermes_home / "state.db")
+        state_conn.execute("CREATE TABLE sessions(id TEXT)")
+        state_conn.commit()
+        state_conn.close()
+
+        provider_state = tmp_path / ".hindsight"
+        provider_state.mkdir()
+        db = provider_state / "live.db"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE facts(value INTEGER)")
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        import hermes_cli.backup as backup_mod
+        monkeypatch.setattr(
+            backup_mod,
+            "_collect_memory_provider_external_paths",
+            lambda: [provider_state],
+        )
+
+        staged = []
+        real_ntf = backup_mod.tempfile.NamedTemporaryFile
+        real_write = backup_mod.zipfile.ZipFile.write
+
+        def _track_temp(*args, **kwargs):
+            handle = real_ntf(*args, **kwargs)
+            staged.append(Path(handle.name))
+            return handle
+
+        def _fail_external_write(zf, filename, arcname=None, *args, **kwargs):
+            if arcname == "_external/.hindsight/live.db":
+                raise OSError("injected external archive failure")
+            return real_write(zf, filename, arcname, *args, **kwargs)
+
+        monkeypatch.setattr(backup_mod.tempfile, "NamedTemporaryFile", _track_temp)
+        monkeypatch.setattr(backup_mod.zipfile.ZipFile, "write", _fail_external_write)
+
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        assert "Backup incomplete" in capsys.readouterr().out
+        assert staged
+        assert all(not path.exists() for path in staged)
 
 
     def test_backup_skips_external_paths_outside_home(self, tmp_path, monkeypatch):
