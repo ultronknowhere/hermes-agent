@@ -725,7 +725,11 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
     t0 = time.monotonic()
 
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
-        archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+        archive_path,
+        "w",
+        zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+        strict_timestamps=False,
     ) as zf:
         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
             try:
@@ -1733,7 +1737,11 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
     archive_started = time.monotonic()
     try:
         with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
-            archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+            archive_path,
+            "w",
+            zipfile.ZIP_DEFLATED,
+            compresslevel=6,
+            strict_timestamps=False,
         ) as zf:
             for index, (abs_path, rel_path) in enumerate(files_to_add, 1):
                 try:
