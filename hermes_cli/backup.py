@@ -286,7 +286,7 @@ def _iter_external_files(base: Path) -> List[Path]:
         dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
         for fname in filenames:
             fpath = dp / fname
-            if fpath.is_symlink():
+            if fpath.is_symlink() or not fpath.is_file():
                 continue
             if fpath.name in _EXCLUDED_NAMES or fpath.name.endswith(_EXCLUDED_SUFFIXES):
                 continue
@@ -327,6 +327,12 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
     # zipfile.write() follows file symlinks, so skip links before any archive
     # write can copy data from outside HERMES_HOME.
     if abs_path.is_symlink():
+        return True
+
+    # os.walk() reports FIFOs, sockets, and device nodes in ``filenames``.
+    # Opening a FIFO for zip input blocks indefinitely waiting for a writer;
+    # sockets/devices are likewise not restorable regular-file content.
+    if not abs_path.is_file():
         return True
 
     try:

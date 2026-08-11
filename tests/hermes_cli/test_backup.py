@@ -133,6 +133,16 @@ class TestShouldExclude:
         # The .db itself is still included (and safe-copied separately)
         assert not _should_exclude(Path("state.db"))
 
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs unavailable on this platform")
+    def test_skips_fifo_special_files(self, tmp_path):
+        """Backup must not open FIFOs, which block forever waiting for a writer."""
+        from hermes_cli.backup import _should_skip_backup_file
+
+        fifo = tmp_path / "pipe.txt"
+        os.mkfifo(fifo)
+
+        assert _should_skip_backup_file(fifo, Path("pipe.txt"), tmp_path / "backup.zip")
+
 
 # ---------------------------------------------------------------------------
 # Backup tests
@@ -1185,6 +1195,20 @@ class TestMemoryProviderExternalPaths:
         (hermes_home / "config.yaml").write_text("model:\n  provider: openrouter\n")
         (hermes_home / ".env").write_text("OPENROUTER_API_KEY=sk-test\n")
         (hermes_home / "state.db").write_bytes(b"x")
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs unavailable on this platform")
+    def test_external_backup_paths_skip_fifo_special_files(self, tmp_path):
+        """Provider backup trees must not yield FIFOs to zipfile.write()."""
+        from hermes_cli.backup import _iter_external_files
+
+        provider_state = tmp_path / ".hindsight"
+        provider_state.mkdir()
+        regular = provider_state / "config.json"
+        regular.write_text("{}")
+        fifo = provider_state / "pipe"
+        os.mkfifo(fifo)
+
+        assert _iter_external_files(provider_state) == [regular]
 
 
     def test_backup_skips_external_paths_outside_home(self, tmp_path, monkeypatch):
