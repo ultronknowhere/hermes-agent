@@ -298,6 +298,19 @@ def _iter_external_files(base: Path) -> List[Path]:
 def _should_exclude(rel_path: Path) -> bool:
     """Return True if *rel_path* (relative to hermes root) should be skipped."""
     parts = rel_path.parts
+    root_component = parts[0] if parts else ""
+
+    # Cron delivery receipts are prunable runtime output, not scheduler state.
+    # Anchor this to actual profile roots so historical evidence containing a
+    # nested ``cron/output`` path remains restorable.
+    is_root_cron_output = parts[:2] == ("cron", "output")
+    is_profile_cron_output = (
+        len(parts) >= 4
+        and parts[0] == "profiles"
+        and parts[2:4] == ("cron", "output")
+    )
+    if is_root_cron_output or is_profile_cron_output:
+        return True
 
     for part in parts:
         if part not in _EXCLUDED_DIRS:
@@ -305,7 +318,7 @@ def _should_exclude(rel_path: Path) -> bool:
         # ``hermes-agent`` only matches at the root level (first component).
         # Nested directories with the same name — e.g.
         # ``skills/autonomous-ai-agents/hermes-agent/`` — must be preserved.
-        if part == "hermes-agent" and part != parts[0]:
+        if part == "hermes-agent" and part != root_component:
             continue
         return True
 
