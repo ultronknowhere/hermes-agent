@@ -1831,15 +1831,119 @@ class HindsightMemoryProvider(MemoryProvider):
         return ("result", result_id or str(id(result)))
 
     @staticmethod
-    def _recall_result_is_conflict(result: Any) -> bool:
-        return any(
-            str(tag).strip().lower() == "conflict"
+    def _recall_result_tags(result: Any) -> set[str]:
+        return {
+            str(tag).strip().lower()
             for tag in (getattr(result, "tags", None) or [])
+            if str(tag).strip()
+        }
+
+    @classmethod
+    def _recall_result_is_conflict(cls, result: Any) -> bool:
+        tags = cls._recall_result_tags(result)
+        return any(
+            tag == "conflict"
+            or tag == "class:conflict"
+            or tag.startswith("conflict:")
+            or tag.startswith("conflict-set:")
+            for tag in tags
         )
 
     @classmethod
     def _recall_group_is_conflict(cls, results: Any) -> bool:
         return any(cls._recall_result_is_conflict(result) for result in results)
+
+    @classmethod
+    def _recall_group_conflict_sets(cls, results: Any) -> set[str]:
+        return {
+            tag.removeprefix("conflict-set:")
+            for result in results
+            for tag in cls._recall_result_tags(result)
+            if tag.startswith("conflict-set:") and tag != "conflict-set:"
+        }
+
+    @classmethod
+    def _recall_group_source_events(cls, results: Any) -> set[str]:
+        return {
+            tag.removeprefix("source-event:")
+            for result in results
+            for tag in cls._recall_result_tags(result)
+            if tag.startswith("source-event:") and tag != "source-event:"
+        }
+
+    @classmethod
+    def _recall_group_supersedes(cls, results: Any) -> set[str]:
+        return {
+            tag.removeprefix("supersedes:")
+            for result in results
+            for tag in cls._recall_result_tags(result)
+            if tag.startswith("supersedes:") and tag != "supersedes:"
+        }
+
+    @classmethod
+    def _recall_linked_group_keys(
+        cls,
+        groups: dict[tuple[str, ...], list[Any]],
+        seed_keys: Any,
+        *,
+        expand_conflicts: bool = True,
+    ) -> set[tuple[str, ...]]:
+        """Expand selected groups across conflict-set and supersession edges."""
+        selected = set(seed_keys)
+        conflict_sets = {
+            key: cls._recall_group_conflict_sets(results)
+            for key, results in groups.items()
+        }
+        source_events = {
+            key: cls._recall_group_source_events(results)
+            for key, results in groups.items()
+        }
+        supersedes = {
+            key: cls._recall_group_supersedes(results)
+            for key, results in groups.items()
+        }
+        legacy_conflicts = {
+            key for key, results in groups.items()
+            if cls._recall_group_is_conflict(results) and not conflict_sets[key]
+        }
+        group_order = list(groups)
+        changed = True
+        while changed:
+            changed = False
+            selected_conflict_sets = set().union(
+                *(conflict_sets[key] for key in selected)
+            ) if selected else set()
+            selected_events = set().union(
+                *(source_events[key] for key in selected)
+            ) if selected else set()
+            selected_supersedes = set().union(
+                *(supersedes[key] for key in selected)
+            ) if selected else set()
+            legacy_linked: set[tuple[str, ...]] = set()
+            if expand_conflicts:
+                for selected_key in selected & legacy_conflicts:
+                    selected_index = group_order.index(selected_key)
+                    legacy_linked.add(selected_key)
+                    for index in range(selected_index - 1, -1, -1):
+                        key = group_order[index]
+                        if key not in legacy_conflicts:
+                            break
+                        legacy_linked.add(key)
+                    for key in group_order[selected_index + 1:]:
+                        if key not in legacy_conflicts:
+                            break
+                        legacy_linked.add(key)
+            for key in groups:
+                linked = expand_conflicts and bool(
+                    conflict_sets[key] & selected_conflict_sets
+                )
+                linked = linked or bool(source_events[key] & selected_supersedes)
+                linked = linked or bool(supersedes[key] & selected_events)
+                linked = linked or key in legacy_linked
+                if linked and key not in selected:
+                    selected.add(key)
+                    changed = True
+        return selected
 
     def _recall_controls_enabled(self) -> bool:
         return any((
@@ -1883,28 +1987,17 @@ class HindsightMemoryProvider(MemoryProvider):
         group_limit = self._recall_result_max_source_groups
         if group_limit and order:
             selected_keys = order[:group_limit]
-            # Conflicts are evidence sets: whenever the bounded selection
-            # intersects a consecutive run of explicitly tagged conflict
-            # sources, retain the whole run rather than presenting one side as
-            # authoritative.  Query filtering may have removed either the
-            # earlier or later side, so expand in both directions and restore
-            # original rank order.
-            if self._recall_result_expand_conflicts:
-                expanded_keys = set(selected_keys)
-                for selected_key in list(selected_keys):
-                    if not self._recall_group_is_conflict(groups[selected_key]):
-                        continue
-                    selected_rank = ranked_order.index(selected_key)
-                    for index in range(selected_rank - 1, -1, -1):
-                        key = ranked_order[index]
-                        if not self._recall_group_is_conflict(groups[key]):
-                            break
-                        expanded_keys.add(key)
-                    for key in ranked_order[selected_rank + 1:]:
-                        if not self._recall_group_is_conflict(groups[key]):
-                            break
-                        expanded_keys.add(key)
-                selected_keys = [key for key in ranked_order if key in expanded_keys]
+            # Evidence relationships cross the rank/query boundary. Whenever a
+            # bounded selection intersects an explicit conflict set or either
+            # side of a supersession edge, retain the complete linked set and
+            # restore original rank order. Legacy exact `conflict` tags remain
+            # supported as one evidence set for backwards compatibility.
+            linked_keys = self._recall_linked_group_keys(
+                groups,
+                selected_keys,
+                expand_conflicts=self._recall_result_expand_conflicts,
+            )
+            selected_keys = [key for key in ranked_order if key in linked_keys]
 
         group_canonicals: list[list[Any]] = []
         for key in selected_keys:
@@ -1937,26 +2030,34 @@ class HindsightMemoryProvider(MemoryProvider):
                 group_canonical.sort(key=lambda item: not self._recall_result_is_conflict(item))
             group_canonicals.append(group_canonical)
 
-        conflict_group_indexes = [
-            index for index, group in enumerate(group_canonicals)
-            if self._recall_group_is_conflict(group)
-        ]
-        conflict_set = len(conflict_group_indexes) > 1
+        evidence_group_indexes = []
+        selected_group_map = {
+            key: groups[key] for key in selected_keys
+        }
+        for index, key in enumerate(selected_keys):
+            linked = self._recall_linked_group_keys(
+                selected_group_map,
+                [key],
+                expand_conflicts=self._recall_result_expand_conflicts,
+            )
+            if len(linked) > 1:
+                evidence_group_indexes.append(index)
+        evidence_set = len(evidence_group_indexes) > 1
         if (
-            conflict_set
+            evidence_set
             and self._recall_result_max_items
-            and self._recall_result_max_items < len(conflict_group_indexes)
+            and self._recall_result_max_items < len(evidence_group_indexes)
         ):
             return []
 
         canonical: list[Any] = []
-        if conflict_set:
-            # Reserve one claim from every conflicting source before ordinary
+        if evidence_set:
+            # Reserve one claim from every linked evidence source before ordinary
             # groups or secondary facts, so global caps cannot present one side.
-            canonical.extend(group_canonicals[index][0] for index in conflict_group_indexes)
-            conflict_indexes = set(conflict_group_indexes)
+            canonical.extend(group_canonicals[index][0] for index in evidence_group_indexes)
+            evidence_indexes = set(evidence_group_indexes)
             for index, group in enumerate(group_canonicals):
-                canonical.extend(group[1:] if index in conflict_indexes else group)
+                canonical.extend(group[1:] if index in evidence_indexes else group)
         else:
             for group in group_canonicals:
                 canonical.extend(group)
@@ -1978,11 +2079,16 @@ class HindsightMemoryProvider(MemoryProvider):
         selected_groups: dict[tuple[str, ...], list[Any]] = {}
         for result in selected:
             selected_groups.setdefault(self._recall_source_key(result), []).append(result)
-        conflict_source_keys = {
-            key for key, group in selected_groups.items()
-            if any(self._recall_result_is_conflict(result) for result in group)
-        }
-        complete_conflict_required = len(conflict_source_keys) > 1
+        required_source_keys: set[tuple[str, ...]] = set()
+        for key in selected_groups:
+            linked = self._recall_linked_group_keys(
+                selected_groups,
+                [key],
+                expand_conflicts=self._recall_result_expand_conflicts,
+            )
+            if len(linked) > 1:
+                required_source_keys.update(linked)
+        complete_evidence_required = len(required_source_keys) > 1
         lines: list[str] = []
         serialized_source_keys: set[tuple[str, ...]] = set()
         cap = self._recall_result_max_chars
@@ -1995,12 +2101,12 @@ class HindsightMemoryProvider(MemoryProvider):
                 # provenance, or safety context and change the claim's meaning.
                 # A partial multi-source conflict is equally unsafe because it
                 # can present one side as authoritative.
-                if complete_conflict_required and not conflict_source_keys.issubset(serialized_source_keys):
+                if complete_evidence_required and not required_source_keys.issubset(serialized_source_keys):
                     return ""
                 break
             lines.append(line)
             serialized_source_keys.add(self._recall_source_key(result))
-        if complete_conflict_required and not conflict_source_keys.issubset(serialized_source_keys):
+        if complete_evidence_required and not required_source_keys.issubset(serialized_source_keys):
             return ""
         return "\n".join(lines)
 

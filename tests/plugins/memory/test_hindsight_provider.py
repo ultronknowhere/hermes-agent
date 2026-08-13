@@ -578,6 +578,162 @@ class TestToolHandlers:
         assert "orange" in payload["result"]
         assert "macarons" not in payload["result"]
 
+    def test_recall_preserves_conflict_set_with_production_tag_taxonomy(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_max_items=8,
+            recall_result_max_chars=900,
+            recall_result_expand_conflicts=True,
+            recall_source_tag_patterns=[r"^source-event:PM-\d{8}-[a-z0-9-]+$"],
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Project Nimbus launch color is purple according to Source A.",
+                type="world", document_id="production-pilot-purple",
+                tags=[
+                    "production-pilot", "class:conflict", "conflict:unresolved",
+                    "conflict-set:nimbus-launch-color", "source:A",
+                    "source-event:PM-20260810-nimbus-purple",
+                ],
+            ),
+            SimpleNamespace(
+                text="The cafeteria served violet macarons.", type="world",
+                document_id="irrelevant-source",
+                tags=["production-pilot", "class:irrelevant"],
+            ),
+            SimpleNamespace(
+                text="Project Nimbus launch color is orange according to Source B.",
+                type="world", document_id="production-pilot-orange",
+                tags=[
+                    "production-pilot", "class:conflict", "conflict:unresolved",
+                    "conflict-set:nimbus-launch-color", "source:B",
+                    "source-event:PM-20260810-nimbus-orange",
+                ],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What is the unresolved Nimbus launch color?"}
+        ))
+
+        assert "purple" in payload["result"]
+        assert "orange" in payload["result"]
+        assert "macarons" not in payload["result"]
+
+    def test_recall_production_conflict_expansion_can_be_disabled(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_expand_conflicts=False,
+            recall_source_tag_patterns=[r"^source-event:PM-\d{8}-[a-z0-9-]+$"],
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Project Nimbus launch color is purple according to Source A.",
+                type="world", document_id="production-pilot-purple",
+                tags=[
+                    "class:conflict", "conflict:unresolved",
+                    "conflict-set:nimbus-launch-color",
+                    "source-event:PM-20260810-nimbus-purple",
+                ],
+            ),
+            SimpleNamespace(
+                text="Project Nimbus launch color is orange according to Source B.",
+                type="world", document_id="production-pilot-orange",
+                tags=[
+                    "class:conflict", "conflict:unresolved",
+                    "conflict-set:nimbus-launch-color",
+                    "source-event:PM-20260810-nimbus-orange",
+                ],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What is the Nimbus launch color?"}
+        ))
+
+        assert "purple" in payload["result"]
+        assert "orange" not in payload["result"]
+
+    def test_recall_preserves_source_event_and_its_superseding_correction(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_max_items=8,
+            recall_result_max_chars=900,
+            recall_source_tag_patterns=[r"^source-event:PM-\d{8}-[a-z0-9-]+$"],
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="The installed checkout historically tracked NousResearch origin/main.",
+                type="world", document_id="production-pilot-baseline",
+                tags=[
+                    "class:correction", "status:superseded",
+                    "source-event:PM-20260810-installed-upstream-baseline",
+                ],
+            ),
+            SimpleNamespace(
+                text="The installed checkout was corrected to downstream ultronknowhere/hermes-agent.",
+                type="world", document_id="production-pilot-correction",
+                tags=[
+                    "class:correction",
+                    "supersedes:PM-20260810-installed-upstream-baseline",
+                    "source-event:PM-20260810-installed-downstream-correction",
+                ],
+            ),
+            SimpleNamespace(
+                text="The cafeteria served violet macarons.", type="world",
+                document_id="irrelevant-source", tags=["class:irrelevant"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall",
+            {"query": "How did the installed Hermes remote source change?"},
+        ))
+
+        assert "historically tracked NousResearch origin/main" in payload["result"]
+        assert "corrected to downstream ultronknowhere/hermes-agent" in payload["result"]
+        assert "macarons" not in payload["result"]
+
+    @pytest.mark.parametrize("limit_name,limit_value", [
+        ("recall_result_max_items", 1),
+        ("recall_result_max_chars", 75),
+    ])
+    def test_recall_abstains_when_cap_cannot_preserve_supersession_pair(
+        self, provider_with_config, limit_name, limit_value
+    ):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_source_tag_patterns=[r"^source-event:PM-\d{8}-[a-z0-9-]+$"],
+            **{limit_name: limit_value},
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="The installed checkout historically tracked NousResearch origin/main.",
+                type="world", document_id="production-pilot-baseline",
+                tags=["source-event:PM-20260810-installed-upstream-baseline"],
+            ),
+            SimpleNamespace(
+                text="The installed checkout was corrected to the downstream repository.",
+                type="world", document_id="production-pilot-correction",
+                tags=[
+                    "supersedes:PM-20260810-installed-upstream-baseline",
+                    "source-event:PM-20260810-installed-downstream-correction",
+                ],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "How did the installed source change?"}
+        ))
+
+        assert payload["result"] == "No relevant memories found."
+
     def test_recall_expands_conflict_run_at_source_group_boundary(self, provider_with_config):
         p = provider_with_config(
             recall_result_max_source_groups=2,
@@ -611,6 +767,36 @@ class TestToolHandlers:
         assert "purple" in payload["result"]
         assert "orange" in payload["result"]
         assert "macarons" not in payload["result"]
+
+    def test_recall_legacy_conflict_expansion_stops_at_ordinary_group(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_expand_conflicts=True,
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Project Nimbus launch color is purple.", type="world",
+                document_id="source-alpha", tags=["pilot", "conflict"],
+            ),
+            SimpleNamespace(
+                text="Robert approved the Cedar migration plan.", type="world",
+                document_id="ordinary-source", tags=["pilot", "decision"],
+            ),
+            SimpleNamespace(
+                text="Project Nimbus launch color is orange.", type="world",
+                document_id="source-beta", tags=["pilot", "conflict"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What is the Nimbus launch color?"}
+        ))
+
+        assert "purple" in payload["result"]
+        assert "orange" not in payload["result"]
+        assert "Cedar" not in payload["result"]
 
     def test_recall_deduplication_does_not_collapse_claims_across_sources(self, provider_with_config):
         p = provider_with_config(
