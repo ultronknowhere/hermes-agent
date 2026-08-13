@@ -44,6 +44,81 @@ def test_read_conn_reused_within_thread(db):
 
 
 @pytest.mark.requires_wal
+def test_read_conn_count_is_bounded_before_open_under_concurrency(db, monkeypatch):
+    """The cap covers in-progress opens, not merely retained connections."""
+    import hermes_state
+
+    thread_count = db._MAX_READ_CONNECTIONS * 3
+    barrier = threading.Barrier(thread_count)
+    release_opens = threading.Event()
+    all_slots_opening = threading.Event()
+    counts_lock = threading.Lock()
+    active = peak = 0
+    real_connect = hermes_state._connect_tracked_db
+
+    def tracked_connect(*args, **kwargs):
+        nonlocal active, peak
+        with counts_lock:
+            active += 1
+            peak = max(peak, active)
+            if active == db._MAX_READ_CONNECTIONS:
+                all_slots_opening.set()
+        release_opens.wait(timeout=5)
+        try:
+            return real_connect(*args, **kwargs)
+        finally:
+            with counts_lock:
+                active -= 1
+
+    monkeypatch.setattr(hermes_state, "_connect_tracked_db", tracked_connect)
+
+    def grab():
+        barrier.wait()
+        db._get_read_conn()
+
+    threads = [threading.Thread(target=grab) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    assert all_slots_opening.wait(timeout=5), "reserved opens did not saturate deterministically"
+    release_opens.set()
+    for thread in threads:
+        thread.join()
+
+    assert peak <= db._MAX_READ_CONNECTIONS
+    assert len(db._read_conns) <= db._MAX_READ_CONNECTIONS
+
+
+@pytest.mark.requires_wal
+def test_overflow_reader_falls_back_and_does_not_retry_open(db, monkeypatch):
+    """A saturated worker uses the writer path and remembers that decision."""
+    import hermes_state
+
+    db._MAX_READ_CONNECTIONS = 1
+    assert db._get_read_conn() is not None  # consume the sole retained slot
+    calls = 0
+    real_connect = hermes_state._connect_tracked_db
+
+    def counting_connect(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(hermes_state, "_connect_tracked_db", counting_connect)
+    results = []
+
+    def overflow_reader():
+        results.append(db.get_session("s1")["id"])
+        results.append(db.get_session("s1")["id"])
+
+    thread = threading.Thread(target=overflow_reader)
+    thread.start()
+    thread.join()
+
+    assert results == ["s1", "s1"]
+    assert calls == 0, "a saturated worker must not repeatedly open SQLite connections"
+
+
+@pytest.mark.requires_wal
 def test_reads_do_not_take_writer_lock(db):
     """Reads must complete while another thread holds self._lock."""
     acquired = db._lock.acquire()

@@ -2477,6 +2477,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _IMPORT_MAX_TOTAL_MESSAGES = 50_000
     _IMPORT_MAX_SESSION_BYTES = 5 * 1024 * 1024
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
+    # The gateway offloads reads through a shared executor whose worker threads
+    # can be replaced over a long process lifetime.  A connection per thread,
+    # retained until SessionDB.close(), otherwise grows without bound and
+    # eventually exhausts the process fd limit.  Overflow readers safely use
+    # the existing locked writer connection via _read_ctx().
+    _MAX_READ_CONNECTIONS = 16
 
     @staticmethod
     def _store_system_prompt(conn, system_prompt: Optional[str]) -> Optional[str]:
@@ -2527,6 +2533,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # _live_connections.  close() drains this set.
         self._read_conns: "set[sqlite3.Connection]" = set()
         self._read_conns_lock = threading.Lock()
+        # Connections are opened outside the lock, so count reservations as
+        # well as registered connections. Without this, a burst of workers can
+        # all pass the retained-count check and exhaust fds before registering.
+        self._read_conns_opening = 0
         # Set when close() begins.  _get_read_conn checks this under the
         # lock so a reader that finishes opening after the drain finds the
         # shutdown in progress and closes its own connection immediately.
@@ -2781,6 +2791,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return conn
         if getattr(self._read_local, "failed", False):
             return None
+        # Reserve a slot before opening: checking only after connect() allows a
+        # concurrent burst to exceed the fd cap while all opens are in flight.
+        with self._read_conns_lock:
+            if self._read_conns_closed:
+                self._read_local.failed = True
+                return None
+            if len(self._read_conns) + self._read_conns_opening >= self._MAX_READ_CONNECTIONS:
+                # Retained slots last for this SessionDB's lifetime. Remember
+                # the fallback per thread instead of reopening and immediately
+                # closing a SQLite connection on every subsequent read.
+                self._read_local.failed = True
+                return None
+            self._read_conns_opening += 1
+        conn = None
+        reserved = True
         try:
             conn = _connect_tracked_db(
                 f"file:{self.db_path}?mode=ro",
@@ -2798,6 +2823,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if self._fts_cjk_loaded:
                 load_fts5_cjk_extension(conn)
             with self._read_conns_lock:
+                self._read_conns_opening -= 1
+                reserved = False
                 if self._read_conns_closed:
                     # close() already drained — don't register; close
                     # immediately so no tracked fd leaks.
@@ -2805,12 +2832,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._read_local.failed = True
                     return None
                 self._read_conns.add(conn)
-        except sqlite3.Error:
-            # Mark this thread failed so we don't retry the open on every
-            # query; the locked writer connection still serves reads.
-            self._read_local.failed = True
-            logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
-            return None
+        except BaseException as exc:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if isinstance(exc, sqlite3.Error):
+                # Mark this thread failed so we don't retry the open on every
+                # query; the locked writer connection still serves reads.
+                self._read_local.failed = True
+                logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
+                return None
+            raise
+        finally:
+            if reserved:
+                with self._read_conns_lock:
+                    self._read_conns_opening -= 1
         self._read_local.conn = conn
         return conn
 
