@@ -149,6 +149,12 @@ _WS_AUTH_TIMEOUT = 20.0
 _WS_READ_IDLE_TIMEOUT = 300.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100  # Buzz channel-membership event — live DM discovery
+_ADD_MEMBER_KIND = 9000  # NIP-29 put-user: the relay stores it only once it has authorized and applied the add
+# ["membership", <add event id>] on a message sent right after adding us (advisor-core post_reply): not an e tag, so
+# it never changes the message's thread.
+_MEMBERSHIP_TAG = "membership"
+_ADD_QUERY_MAX = 200  # the CLI's --limit cap (the relay's is higher): fewer results than this is the complete set
+_EVENT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 # Credentials JSON fallback when BUZZ_PRIVATE_KEY is not set; module-level so tests can point it at a tmpdir.
 _DEFAULT_CREDENTIALS_DIR = Path("~/.config/buzz").expanduser()
@@ -557,6 +563,8 @@ class BuzzAdapter(BasePlatformAdapter):
         # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None], "event_meta":
         #   OrderedDict[event_id, (author_pubkey, snippet)]}; event_meta backs NIP-10 reply-parent resolution.
         self._channel_state: Dict[str, dict] = {}
+        # Channels whose seed is in progress: not yet subscribed or polled, or their unseen history would replay.
+        self._seeding: set = set()
         # Cursors read from disk at connect(), consumed by each channel's first seed.
         self._restored_cursors: Dict[str, dict] = {}
         # Orders off-loop cursor writes: each snapshot is taken under it, so an older one never lands last.
@@ -1066,7 +1074,7 @@ class BuzzAdapter(BasePlatformAdapter):
         before = set(self._channel_state)
         await self._discover_dms(seed=False)
         for channel_id in list(self._channel_state):
-            if channel_id in before:
+            if channel_id in before or channel_id in self._seeding:  # a concurrent adoption subscribes it once seeded
                 continue
             subscription_id = f"hermes-buzz-dm-{len(subscriptions)}"
             subscriptions[subscription_id] = channel_id
@@ -1258,13 +1266,14 @@ class BuzzAdapter(BasePlatformAdapter):
             self._restored_cursors[str(channel_id)] = {"chat_type": str(entry.get("chat_type") or ""), "last_ts": last_ts, "seen": seen}
 
     def _cursor_payload(self) -> dict:
-        """Snapshot of every watched channel's cursor (taken on the loop: ``_channel_state`` is loop-owned)."""
+        """Snapshot of every watched channel's cursor (taken on the loop: ``_channel_state`` is loop-owned). A channel
+        still seeding is left out: restored after a restart, its empty cursor would replay the channel's history."""
         channels = {
             channel_id: {
                 "chat_type": state.get("chat_type") or "group", "last_ts": int(state.get("last_ts") or 0),
                 "seen": list(state.get("seen") or ()),
             }
-            for channel_id, state in self._channel_state.items()
+            for channel_id, state in self._channel_state.items() if channel_id not in self._seeding
         }
         return {"identity": self._self_pubkey, "relay": self.relay_url, "channels": channels}
 
@@ -1302,18 +1311,50 @@ class BuzzAdapter(BasePlatformAdapter):
         self._channel_state[channel_id] = state
         return True
 
-    async def _seed_channel(self, channel_id: str, chat_type: str) -> None:
-        """Initialize a channel's high-water mark from its newest events."""
+    async def _seed_channel(self, channel_id: str, chat_type: str, joined_live: bool = False) -> None:
+        """Initialize a channel's high-water mark from its newest events. With ``joined_live`` (adopted mid-run), a
+        message that names the add that admitted us and p-tags us was sent with our join, not before it: it is
+        handled like a live event — mention gate, seen set, cursor — instead of being seeded as history."""
         if self._restore_channel_state(channel_id, chat_type):
             return
+        # Installed before the first await: a concurrent adoption (notification handler vs. discovery sweep) sees the
+        # channel as watched and leaves it alone, so the message sent with our join is handled once. Until the seed is
+        # done, _seeding keeps the channel from being subscribed or polled, which would replay its unseen history.
         state = self._channel_state[channel_id] = self._new_channel_state(chat_type)
+        self._seeding.add(channel_id)
+        try:
+            sent_with_join = await self._seed_from_history(channel_id, state, joined_live)
+        except BaseException:
+            # Interrupted (e.g. a socket close cancels discovery) before its history was marked seen: watched with no
+            # cursor, a reconnect would subscribe it from its start. Unwatched, the next discovery adopts it afresh.
+            if self._channel_state.get(channel_id) is state:
+                del self._channel_state[channel_id]
+            raise
+        finally:
+            self._seeding.discard(channel_id)
+        # De-duplicated by the seen set against the subscription and poll, which may now deliver it too.
+        if sent_with_join:
+            await self._handle_events(channel_id, state, sent_with_join)
+
+    async def _seed_from_history(self, channel_id: str, state: dict, joined_live: bool) -> List[dict]:
+        """Mark the channel's newest events seen; return those sent with our join (see _seed_channel)."""
         code, out, err = await self._run_cli(["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)])
         if code != 0:
             logger.warning("Buzz: could not seed channel %s — %s", channel_id, _cli_error_message(err, code))
             # "now" so a transiently unreadable channel never replays its history later.
             state["last_ts"] = int(time.time())
-            return
-        for event in _parse_json_list(out):
+            return []
+        events = _parse_json_list(out)
+        admitting = set()
+        if joined_live:
+            for add_id in {ref for e in events if (ref := self._membership_ref(e)) and self._p_tagged_to_self(e)}:
+                if await self._admitted_us(channel_id, add_id):
+                    admitting.add(add_id)
+        sent_with_join = []
+        for event in events:
+            if self._membership_ref(event) in admitting and self._p_tagged_to_self(event):
+                sent_with_join.append(event)
+                continue
             if event_id := event.get("id"):
                 state["seen"][str(event_id)] = None
             state["last_ts"] = max(state["last_ts"], int(event.get("created_at") or 0))
@@ -1322,6 +1363,36 @@ class BuzzAdapter(BasePlatformAdapter):
             self._remember_event(state, event)
             self._maybe_latch_dm(channel_id, state, event)
         self._trim_seen(state)
+        return sent_with_join
+
+    @staticmethod
+    def _membership_ref(event: dict) -> str:
+        """The add an event names in its ["membership", <add id>] tag, if it is a well-formed event id."""
+        ref = next((str(t[1]) for t in event.get("tags", []) if len(t) > 1 and t[0] == _MEMBERSHIP_TAG), "")
+        return ref if _EVENT_ID_RE.match(ref) else ""
+
+    def _adds_us(self, channel_id: str, event: dict) -> bool:
+        return (int(event.get("kind") or 0) == _ADD_MEMBER_KIND and self._p_tagged_to_self(event)
+                and any(t[:2] == ["h", channel_id] for t in event.get("tags", [])))
+
+    async def _admitted_us(self, channel_id: str, add_id: str) -> bool:
+        """Whether ``add_id`` is the add that admitted us to ``channel_id``: a kind-9000 event the relay holds in that
+        channel that p-tags us (the relay stores an add only after authorizing it), with no later add of us after it
+        (a later one means the reference is from an earlier membership). When the adds since it fill a page, that
+        can't be ruled out, so it doesn't qualify: the message is seeded, as before this change."""
+        code, out, _err = await self._run_cli(["social", "event", "--event", add_id])
+        add = next((e for e in _parse_json_list(out) if code == 0 and str(e.get("id")) == add_id), None)
+        if add is None or not self._adds_us(channel_id, add):
+            return False
+        mark = (int(add.get("created_at") or 0), add_id)
+        code, out, _err = await self._run_cli(["messages", "get", "--channel", channel_id, "--kinds",
+                                               str(_ADD_MEMBER_KIND), "--since", str(mark[0]),
+                                               "--limit", str(_ADD_QUERY_MAX)])
+        later = _parse_json_list(out)
+        if code != 0 or len(later) >= _ADD_QUERY_MAX:
+            return False
+        return not any(self._adds_us(channel_id, e) and (int(e.get("created_at") or 0), str(e.get("id"))) > mark
+                       for e in later)
 
     async def _discover_dms(self, *, seed: bool) -> None:
         """Watch DMs: startup ones are seeded, mid-run ones dispatch from their start. ``dms list`` is best-effort
@@ -1359,8 +1430,9 @@ class BuzzAdapter(BasePlatformAdapter):
                 # Live adoption of real community channels joined mid-run (#75107): in watch-all mode (no
                 # explicit channels list) a channel the agent is added to after connect() must start
                 # dispatching without a gateway restart. Unlike a fresh DM its history predates us, so it is
-                # always seeded from its newest events — only messages sent after adoption dispatch.
-                await self._seed_channel(ch_id, chat_type="group")
+                # always seeded from its newest events — only messages sent after adoption dispatch, and the one
+                # sent with our join (it names the add that admitted us; see _seed_channel).
+                await self._seed_channel(ch_id, chat_type="group", joined_live=True)
                 logger.info("Buzz: adopted newly joined channel %s (%s)", ch_id, self._channel_names.get(ch_id, ch_id))
 
     async def _adopt_conversation(self, channel_id: str, seed: bool) -> None:
@@ -1372,7 +1444,7 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _poll_channel(self, channel_id: str) -> None:
         state = self._channel_state.get(channel_id)
-        if state is None:
+        if state is None or channel_id in self._seeding:
             return
         args = ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
         if state["last_ts"]:

@@ -3427,6 +3427,205 @@ class TestChannelCursorPersistence:
         await restarted._poll_channel(CHANNEL)
         assert [d["message_id"] for d in restarted._dispatched] == ["e2"]
 
+    # Ticket Viewer, 2026-10-30: FRIDAY added Jarvis (kind 9000) and mentioned it in the same second. Jarvis adopted
+    # the channel a second later and seeded the mention as history, so it never reached the mention gate. FRIDAY now
+    # names the add in a ["membership", <add id>] tag; adoption dispatches a mention carrying the add that admitted us.
+    ADD = _event("a" * 64, pubkey=AGENT_PUBKEY, kind=9000, created_at=500, content="")
+    ADD["tags"] = [["h", CHANNEL], ["p", SELF_PUBKEY]]
+    EARLIER_ADD = {**ADD, "id": "b" * 64, "created_at": 300}  # superseded by ADD
+    OTHERS_ADD = {**ADD, "id": "c" * 64, "created_at": 501, "tags": [["h", CHANNEL], ["p", OTHER_PUBKEY]]}
+
+    @staticmethod
+    def _referencing(event_id, add_id, *, p=SELF_PUBKEY, created_at=500, **kwargs):
+        event = _tagged_event(event_id, CHANNEL, content="please continue", p=p, created_at=created_at, **kwargs)
+        event["tags"].append(["membership", add_id])
+        return event
+
+    def _channel_history(self):
+        return [
+            self.EARLIER_ADD, self.ADD, self.OTHERS_ADD,
+            _tagged_event("old", CHANNEL, content="@Chip before we joined", created_at=400, p=SELF_PUBKEY),
+            self._referencing("ask", self.ADD["id"], root="r" * 64, reply_to="q" * 64),
+            self._referencing("stale", self.EARLIER_ADD["id"]),
+            self._referencing("not-ours", self.OTHERS_ADD["id"]),
+            self._referencing("unknown", "d" * 64),
+            self._referencing("malformed", "--limit"),
+            self._referencing("unaddressed", self.ADD["id"], p=None),
+            # Chatter after the mention: the cursor is past it, so only adoption can deliver it.
+            *(_tagged_event(f"chat{i}", CHANNEL, content="chatter", created_at=501) for i in range(5)),
+        ]
+
+    @staticmethod
+    def _relay_cli(relay):
+        """``buzz`` over a stored channel: ``messages get`` returns the newest --limit events of --kinds (default chat)
+        in [--since, --before]."""
+        async def cli(args, *, input_text=None):
+            await asyncio.sleep(0)  # a subprocess call yields to other tasks, as the real CLI does
+            if args[:2] == ["social", "event"]:
+                return 0, json.dumps([e for e in relay if e["id"] == args[args.index("--event") + 1]]), ""
+            if args[:2] == ["channels", "list"]:
+                return 0, json.dumps([{"channel_id": CHANNEL, "name": "Ticket Viewer",
+                                       "description": "Ticket Viewer work", "created_at": 1}]), ""
+            if args[:2] != ["messages", "get"]:
+                return 0, "[]", ""
+            kinds = {int(k) for k in args[args.index("--kinds") + 1].split(",")} if "--kinds" in args else {9}
+            since = int(args[args.index("--since") + 1]) if "--since" in args else 0
+            until = int(args[args.index("--before") + 1]) if "--before" in args else float("inf")
+            limit = int(args[args.index("--limit") + 1])
+            found = sorted((e for e in relay if e["kind"] in kinds and since <= e["created_at"] <= until),
+                           key=lambda e: e["created_at"])
+            return 0, json.dumps(found[-limit:]), ""
+        return cli
+
+    def _restart(self, cli):
+        restarted = _make_adapter()
+        restarted._dispatched = []
+
+        async def capture(**kwargs):
+            restarted._dispatched.append(kwargs)
+
+        restarted._dispatch_message = capture
+        restarted._message_handler = AsyncMock()
+        restarted._run_cli = cli
+        restarted._load_cursors()
+        return restarted
+
+    @pytest.mark.asyncio
+    async def test_notification_adoption_dispatches_the_mention_naming_our_add_once(self, adapter):
+        relay = self._channel_history()
+        adapter._run_cli = cli = self._relay_cli(relay)
+        adapter._load_cursors()
+        websocket = SimpleNamespace(sent=[])
+
+        async def send(raw):
+            websocket.sent.append(json.loads(raw))
+
+        websocket.send = send
+        added = {"id": "n" * 64, "pubkey": "e" * 64, "kind": 44100, "created_at": 500, "content": "{}",
+                 "tags": [["p", SELF_PUBKEY], ["h", CHANNEL]]}
+        subscriptions = {}
+        await adapter._handle_ws_message(websocket, subscriptions, ["EVENT", "hermes-buzz-membership", added])
+        assert [d["message_id"] for d in adapter._dispatched] == ["ask"]
+        # Its thread is the one its root/reply tags name; the membership tag is not a parent.
+        assert adapter._thread_roots["ask"] == "r" * 64
+
+        # The subscription replays stored events, a reconnect redelivers the notification, the poll overlaps.
+        [(_req, subscription_id, _filter)] = websocket.sent
+        for event in relay:
+            await adapter._handle_ws_message(websocket, subscriptions, ["EVENT", subscription_id, event])
+        await adapter._handle_ws_message(websocket, subscriptions, ["EVENT", "hermes-buzz-membership", added])
+        await adapter._poll_channel(CHANNEL)
+        assert [d["message_id"] for d in adapter._dispatched] == ["ask"]
+
+        restarted = self._restart(cli)
+        await restarted._seed_channel(CHANNEL, chat_type="group")
+        await restarted._discover_dms(seed=False)
+        await restarted._poll_channel(CHANNEL)
+        assert restarted._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_discovery_sweep_adoption_dispatches_the_mention_naming_our_add_once(self, adapter):
+        adapter._run_cli = cli = self._relay_cli(self._channel_history())
+        adapter._load_cursors()
+        await adapter._discover_dms(seed=False)  # a sweep, with no membership notification
+        await adapter._discover_dms(seed=False)
+        await adapter._poll_channel(CHANNEL)
+        assert [d["message_id"] for d in adapter._dispatched] == ["ask"]
+
+        restarted = self._restart(cli)
+        await restarted._seed_channel(CHANNEL, chat_type="group")
+        await restarted._poll_channel(CHANNEL)
+        assert restarted._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_concurrent_notification_and_sweep_adoption_dispatch_once(self, adapter):
+        """The notification handler and the discovery sweep are separate tasks: both may find the channel unwatched.
+        One adopts it; nothing subscribes or polls it until its seed is done, so its history is never replayed."""
+        relay = self._channel_history()
+        adapter._run_cli = self._relay_cli(relay)
+        websocket = SimpleNamespace(sent=[])
+
+        async def send(raw):
+            websocket.sent.append(json.loads(raw))
+
+        websocket.send = send
+        subscriptions = {}
+
+        async def poll_while_adopting():
+            for _ in range(10):
+                await adapter._poll_channel(CHANNEL)
+                await asyncio.sleep(0)
+
+        await asyncio.gather(adapter._rediscover_and_subscribe(websocket, subscriptions),
+                             adapter._rediscover_and_subscribe(websocket, subscriptions), poll_while_adopting())
+        [(_req, subscription_id, request_filter)] = websocket.sent
+        assert request_filter.get("since")  # subscribed from the seeded cursor, not from the channel's start
+        for event in relay:  # the relay answers the subscription with what it holds
+            await adapter._handle_ws_message(websocket, subscriptions, ["EVENT", subscription_id, event])
+        assert [d["message_id"] for d in adapter._dispatched] == ["ask"]
+
+    @pytest.mark.asyncio
+    async def test_an_interrupted_adoption_leaves_nothing_to_replay(self, adapter):
+        """A socket close cancels discovery mid-seed. The unfinished channel must not stay watched with no cursor (a
+        reconnect would subscribe it from its start): the next discovery adopts it afresh."""
+        relay = self._channel_history()
+        cli = self._relay_cli(relay)
+        stalled = asyncio.Event()
+
+        async def stalling_cli(args, *, input_text=None):
+            if "--kinds" in args:
+                stalled.set()
+                await asyncio.Event().wait()  # the add lookup never answers before the cancel
+            return await cli(args, input_text=input_text)
+
+        adapter._run_cli = stalling_cli
+        discovery = asyncio.create_task(adapter._discover_dms(seed=False))
+        await stalled.wait()
+        # Another channel's event persists cursors meanwhile: the unfinished seed must not reach disk, or a restart
+        # would restore it (no cursor, nothing seen) and replay the channel's history.
+        assert CHANNEL not in adapter._cursor_payload()["channels"]
+        discovery.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await discovery
+        assert CHANNEL not in adapter._channel_state
+
+        adapter._run_cli = cli
+        await adapter._discover_dms(seed=False)
+        await adapter._poll_channel(CHANNEL)
+        assert [d["message_id"] for d in adapter._dispatched] == ["ask"]
+
+    @pytest.mark.asyncio
+    async def test_the_named_add_is_checked_however_many_adds_follow_it(self, adapter):
+        """The add is fetched by the id the message names, not found by paging adds the CLI can't filter by member;
+        later adds of others in one second don't hide it. Only a full page of later adds leaves it unproven."""
+        others = [{**self.OTHERS_ADD, "id": f"{i:064x}", "created_at": 501} for i in range(60)]
+        adapter._run_cli = self._relay_cli(self._channel_history() + others)
+        await adapter._discover_dms(seed=False)
+        assert [d["message_id"] for d in adapter._dispatched] == ["ask"]
+
+        flooded = _make_adapter()
+        flooded._dispatched = []
+
+        async def capture(**kwargs):
+            flooded._dispatched.append(kwargs)
+
+        flooded._dispatch_message = capture
+        flooded._message_handler = AsyncMock()
+        flood = [{**self.OTHERS_ADD, "id": f"{i:064x}", "created_at": 501} for i in range(200)]
+        flooded._run_cli = self._relay_cli(self._channel_history() + flood)
+        await flooded._discover_dms(seed=False)
+        await flooded._poll_channel(CHANNEL)
+        assert flooded._dispatched == []  # seeded as history, as before this change: never a replay
+
+    @pytest.mark.asyncio
+    async def test_adoption_dispatches_nothing_without_an_add_for_us(self, adapter):
+        """A reference to an add the relay does not hold for us in this channel qualifies nothing."""
+        history = [e for e in self._channel_history() if e["kind"] != 9000 or e is self.OTHERS_ADD]
+        adapter._run_cli = self._relay_cli(history)
+        await adapter._discover_dms(seed=False)
+        await adapter._poll_channel(CHANNEL)
+        assert adapter._dispatched == []
+
     @pytest.mark.asyncio
     async def test_cursor_survives_only_for_the_same_identity_and_relay(self, adapter, tmp_path, monkeypatch):
         await self._seed(adapter, _event("e1", created_at=100))
